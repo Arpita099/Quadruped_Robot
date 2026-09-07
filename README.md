@@ -1,105 +1,130 @@
 # Sim-to-Sim Quadruped Locomotion in MuJoCo
 
-A compact robotics project for running a **pretrained reinforcement-learning locomotion policy** on a **Unitree Go2 quadruped** in the MuJoCo physics simulator.
+This is a small robotics project where I run a **pretrained reinforcement learning locomotion policy** for a **Unitree Go2 quadruped robot** in MuJoCo.
 
-The project demonstrates a practical **sim-to-sim transfer pipeline**: robot-state observations are collected in MuJoCo, converted to the ordering expected by the learned policy, passed through a TorchScript policy, and transformed into joint targets that are executed using a PD-style torque controller.
+I did not train the RL policy from scratch. The pretrained policy is already provided as `policy.pt`. My main work in this project was to understand how the policy works with the robot state, how the observation is prepared, how the joint order is converted, and how the policy output is finally used to control the robot in MuJoCo.
 
-> **Note:** The repository contains a pretrained `policy.pt`. The policy-training pipeline is not part of this repository; this project focuses on policy deployment, simulator interfacing, observation/action mapping, and low-level control.
+## Project Flow
 
-## Project Overview
+The basic flow of the project is:
 
-The main objective is to execute a learned quadruped locomotion controller in MuJoCo while preserving the observation and action conventions expected by the original training environment.
-
-```mermaid
-flowchart LR
-    A[MuJoCo Go2 State] --> B[48-D Observation]
-    B --> C[State / Joint-Order Conversion]
-    C --> D[Pretrained RL Policy]
-    D --> E[12 Joint Actions]
-    E --> F[Action Scaling + Default Pose]
-    F --> G[PD / Torque Controller]
-    G --> H[MuJoCo Simulation]
-    H --> A
+```text
+MuJoCo robot state
+        ↓
+Build observation
+        ↓
+Convert joint/state order
+        ↓
+Pretrained RL policy
+        ↓
+12 joint actions
+        ↓
+Convert actions to target joint positions
+        ↓
+PD controller
+        ↓
+MuJoCo robot
 ```
 
-The control loop includes:
+The policy takes the current state of the robot and predicts the action for the 12 joints.
 
-- MuJoCo-based simulation of the Unitree Go2 quadruped
-- 48-dimensional policy observation construction
-- Base linear and angular velocity information
-- Projected gravity / robot orientation information
-- Velocity command conditioning
-- 12-DoF joint position and velocity feedback
-- Previous-action feedback
-- Isaac-style ↔ MuJoCo joint-order conversion
-- TorchScript policy inference
-- Joint target generation
-- Torque-limited PD-style control
-- Control decimation between physics and policy update rates
+## Observation
 
-## Key Concepts
+The policy uses a **48-dimensional observation**.
 
-### 1. Sim-to-Sim Policy Transfer
+It contains:
 
-A policy trained in one simulation framework may expect a particular observation definition, joint order, coordinate convention, and action representation. Running that policy in another simulator therefore requires careful interface alignment.
+| Observation           | Dimension |
+| --------------------- | --------: |
+| Base linear velocity  |         3 |
+| Base angular velocity |         3 |
+| Projected gravity     |         3 |
+| Motion command        |         3 |
+| Joint position        |        12 |
+| Joint velocity        |        12 |
+| Previous action       |        12 |
+| Total                 |        48 |
 
-This implementation handles that deployment layer inside `sim2sim.py`.
+So before giving anything to the policy, I need to collect these values from MuJoCo and keep them in the same format that the policy expects.
 
-### 2. Observation Space
+## Policy Output
 
-The policy receives a **48-dimensional observation vector** composed of:
+The policy gives **12 actions** because the Go2 robot has 12 controlled joints.
 
-| Observation | Dimension |
-| --- | ---: |
-| Base linear velocity | 3 |
-| Base angular velocity | 3 |
-| Projected gravity / orientation | 3 |
-| Motion command | 3 |
-| Joint position offsets | 12 |
-| Joint velocities | 12 |
-| Previous actions | 12 |
-| **Total** | **48** |
-
-### 3. Action Space
-
-The neural policy produces **12 actions**, one for each actuated joint of the quadruped.
-
-The actions are reordered for MuJoCo, scaled, and added to the nominal standing pose:
+The action is converted to a target joint position using:
 
 ```python
 target_dof_pos = action * action_scale + default_angles
 ```
 
-### 4. Joint-Order Conversion
+After that, the target joint positions are sent to the low-level controller.
 
-The policy and MuJoCo use different arrangements for the 12 leg joints. The project provides two conversion functions:
+## Joint Order Conversion
+
+One important part of this project is the joint ordering.
+
+The pretrained policy and MuJoCo do not use the joint values in exactly the same order, so I use two functions:
 
 ```python
 isaac2mujoco(inputs)
 mujoco2isaac(inputs)
 ```
 
-Correct joint mapping is essential for transferring a locomotion policy across simulators.
+These functions convert the joint values between the policy format and MuJoCo format.
 
-### 5. Low-Level Torque Control
+If the joint order is wrong, the action can be sent to the wrong leg joint and the robot movement will not be correct.
 
-The policy predicts joint-level commands rather than applying raw torques directly. A PD-style controller converts target joint positions into actuator efforts, with torque saturation based on actuator and joint-velocity limits.
+## PD Control
 
-Conceptually:
+The policy does not directly give the final torque.
+
+First, the policy action is converted to a target joint position. Then the PD controller calculates the torque from the joint position error and joint velocity.
+
+The simple idea is:
 
 ```text
-Policy action
-    ↓
-Target joint position
-    ↓
-Position error + joint velocity
-    ↓
-PD-style controller
-    ↓
-Torque / actuator effort
-    ↓
-MuJoCo robot
+target joint position
+        ↓
+compare with current joint position
+        ↓
+PD controller
+        ↓
+joint torque
+        ↓
+robot movement
 ```
+
+Torque limits are also used so that the applied torque stays inside the allowed range.
+
+## Simulation and Control Frequency
+
+The simulation timestep is:
+
+```python
+simulation_dt = 0.002
+```
+
+So MuJoCo runs at around **500 Hz**.
+
+The control decimation is:
+
+```python
+control_decimation = 10
+```
+
+That means the policy is not called at every physics step. It is called after every 10 simulation steps.
+
+So the policy runs at around **50 Hz**.
+
+## Default Command
+
+The current command is:
+
+```python
+cmd_init = [1.5, 0.0, 0.0]
+```
+
+This command is also included in the observation and tells the policy what type of motion is expected.
 
 ## Repository Structure
 
@@ -109,67 +134,34 @@ MuJoCo robot
 ├── policy.pt
 └── robots/
     ├── go1/
-    │   ├── assets/
-    │   ├── go1.xml
-    │   └── scene.xml
     └── go2/
-        ├── assets/
-        ├── go2.xml
-        ├── go2_mjx.xml
-        ├── scene.xml
-        └── scene_mjx.xml
 ```
 
-The current simulation script uses:
+For this project I am using:
 
 ```text
 robots/go2/scene.xml
 ```
 
-## Requirements
+## Installation
 
-Recommended environment:
-
-- Python 3.10+
-- MuJoCo
-- NumPy
-- PyTorch
-- SciPy
-
-Install the Python dependencies with:
+Required packages:
 
 ```bash
 pip install mujoco numpy torch scipy
 ```
 
-> Depending on your operating system and PyTorch configuration, you may prefer to install PyTorch using the command recommended on the official PyTorch website.
-
-## Running the Project
-
-Clone the repository and enter the project directory:
-
-```bash
-git clone <your-repository-url>
-cd <repository-name>
-```
-
-Install dependencies:
-
-```bash
-pip install mujoco numpy torch scipy
-```
-
-Run the simulation:
+Then run:
 
 ```bash
 python sim2sim.py
 ```
 
-A MuJoCo viewer should open and execute the locomotion policy on the Go2 model.
+The MuJoCo viewer will open and the Go2 robot will run using the pretrained locomotion policy.
 
 ## Main Configuration
 
-Important parameters are defined in the `config` dictionary in `sim2sim.py`:
+Some important settings are:
 
 ```python
 config = {
@@ -187,60 +179,43 @@ config = {
 }
 ```
 
-**Implementation note:** in the current code, `pd_control()` delegates to `joint_torque()`, whose internal controller uses default stiffness `50.0` and damping `0.5`. The `kps`/`kds` arguments in the configuration are therefore not fully propagated into the final torque computation. This is a useful point to clean up if the controller is extended.
+One thing I found from the current code is that the `kps` and `kds` values from the config are not fully used inside the final torque calculation because `joint_torque()` has its own default values.
 
-With a simulation timestep of `0.002 s` and control decimation of `10`, physics is stepped at approximately **500 Hz**, while the learned policy is evaluated approximately every **20 ms (50 Hz)**.
+This part can be improved later.
 
-The default command is:
+## What I Learned
 
-```python
-cmd_init = [1.5, 0.0, 0.0]
-```
+From this project I mainly learned how a pretrained RL policy is connected with a robot simulator.
 
-which represents the three command values supplied to the locomotion policy.
+I also learned about:
 
-## Technical Highlights
+* robot state representation
+* observation and action space
+* joint ordering
+* quadruped locomotion
+* policy inference
+* PD control
+* torque control
+* control frequency
+* sim-to-sim policy transfer
 
-This project provides hands-on experience with:
+This project also helped me understand that using a trained RL policy on another simulator is not only about loading the model. The robot state, joint order, action format, controller, and simulation settings also need to match correctly.
 
-- Reinforcement learning policy deployment
-- Legged robot locomotion
-- Robot simulation with MuJoCo
-- Sim-to-sim transfer
-- Coordinate and joint-space transformations
-- Quaternion-based orientation processing
-- Robot observation design
-- Neural-network policy inference with PyTorch/TorchScript
-- Joint-space control
-- PD control and actuator saturation
-- Multi-rate simulation and control loops
+## Future Work
 
-## Potential Extensions
+In the future I want to test the policy under different conditions, for example:
 
-Several research-oriented extensions can be built on top of the current pipeline:
+* different ground friction
+* different robot mass
+* sensor noise
+* observation delay
+* external disturbance
+* different velocity commands
 
-- **Dynamics randomization:** vary mass, friction, actuator strength, and contact parameters.
-- **Robustness evaluation:** measure locomotion performance under external disturbances.
-- **Sensor uncertainty:** add noise or delay to joint, velocity, and orientation measurements.
-- **Command tracking analysis:** evaluate tracking error across different desired velocities.
-- **Safety-aware control:** introduce constraints or a safety layer around learned actions.
-- **Adaptive control:** compensate for model mismatch between training and deployment simulators.
-- **Sim-to-real preparation:** investigate which simulator discrepancies most strongly affect transfer to a physical quadruped.
+I am interested in seeing how these changes affect the stability of the robot and how robust the pretrained policy is.
 
-These extensions connect learned locomotion with broader research topics in **reinforcement learning, autonomous systems, robust/adaptive control, and safe robotics**.
+## Note
 
-## Research Motivation
+The RL policy used in this repository is pretrained. The training code is not included here.
 
-Reliable deployment of learning-based controllers requires more than training a policy. The observation space, coordinate conventions, actuator limits, control frequency, robot dynamics, and low-level controller must remain consistent across environments.
-
-This project explores that deployment problem through a quadruped locomotion example and provides a foundation for studying **robust learning-enabled control under simulator mismatch and uncertainty**.
-
-## Acknowledgment and Attribution
-
-This repository uses a **pretrained TorchScript locomotion policy** and robot model/assets supplied with the project materials. The focus of this implementation is the MuJoCo deployment and sim-to-sim control pipeline.
-
-Before redistributing the pretrained policy or Unitree robot meshes/XML files publicly, verify the **original source, license, and redistribution terms** for those assets and add the appropriate attribution here.
-
-## Disclaimer
-
-This repository is intended for educational and research purposes. Results obtained in simulation do not by themselves demonstrate safe operation on physical hardware.
+My work in this project is mainly focused on running the policy in MuJoCo, understanding the robot-policy interface, and studying the control pipeline.
